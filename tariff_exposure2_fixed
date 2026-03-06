@@ -1,0 +1,1072 @@
+# tariff_exposure2.py
+"""
+Production-grade tariff exposure estimator (proxy) + polished executive Excel.
+
+Major upgrades vs earlier versions
+----------------------------------
+- Performance: vectorized keyword matching (compiled regex + str.contains) and vectorized text_blob build.
+- Correctness: High scenario avoids double-counting via per-line MAX exposure fraction.
+- Reporting quality: Vendor "parenting" (suffix stripping) for Top Suppliers rollups.
+- Configurability: Optional heuristics JSON file to override keyword lists and vendor hint lists.
+- Data quality controls: amount parse diagnostics, zero-spend rate, missing vendor rate, coverage check vs expected.
+- Excel stability: no Excel "Tables" (prevents Excel Repair removal), safe filters + freeze panes.
+- Excel robustness: strips illegal worksheet characters to prevent IllegalCharacterError.
+
+Outputs
+-------
+outdir/
+  tariff_executive_report.xlsx
+  tariff_summary.json
+  top_suppliers_base.csv
+  top_categories_base.csv
+  tariff_lines_scored.csv        (optional; can be very large)
+  run_log.txt
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+except ImportError as e:  # pragma: no cover
+    raise SystemExit("Missing dependency: openpyxl. Install with: pip install openpyxl") from e
+
+
+AMOUNT_COL_CANDIDATES = [
+    "Extended Price",
+    "Line Amount",
+    "Amount",
+    "Total",
+    "Total Amount",
+    "Net Amount",
+    "PO Line Amount",
+    "Line Total",
+    "Spend",
+    "Value",
+    "Invoice Amount",
+    "Line Net Amount",
+]
+
+DESC_COL_CANDIDATES = [
+    "Description",
+    "Item Description",
+    "Line Description",
+    "Product Description",
+    "Material Description",
+    "Service Description",
+    "Commodity Description",
+    "Line Text",
+]
+
+VENDOR_COL_CANDIDATES = [
+    "Vendor Name",
+    "Supplier Name",
+    "Supplier",
+    "Vendor",
+    "Supplier",
+    "Payee",
+    "Vendor/Supplier",
+    "Vendor/Supplier Name",
+]
+
+CATEGORY_COL_CANDIDATES = [
+    "Category",
+    "Commodity",
+    "Commodity Code",
+    "Commodity Name",
+    "Spend Category",
+    "Category Name",
+    "GL Description",
+    "GL Account Name",
+    "GL",
+    "Account Description",
+]
+
+UNSPSC_COL_CANDIDATES = ["UNSPSC", "UNSPSC Code", "UNSPSC Number"]
+
+COUNTRY_COL_CANDIDATES = [
+    "Supplier Country",
+    "Vendor Country",
+    "Remit Country",
+    "Country",
+    "Country Name",
+    "Supplier Country Code",
+    "Vendor Country Code",
+    "Remit Country Code",
+    "Ship From Country",
+    "ShipTo Country",
+    "Bill To Country",
+    "BillTo Country",
+]
+
+ADDRESS_COL_CANDIDATES = [
+    "Supplier Address",
+    "Vendor Address",
+    "Remit Address",
+    "Address",
+    "City",
+    "State",
+    "Zip",
+]
+
+
+DEFAULT_SERVICE_KEYWORDS = [
+    "service",
+    "services",
+    "svc",
+    "labor",
+    "labour",
+    "professional",
+    "consulting",
+    "consultant",
+    "managed service",
+    "outsourcing",
+    "implementation",
+    "integration",
+    "configuration",
+    "support",
+    "technical support",
+    "helpdesk",
+    "maintenance",
+    "repair",
+    "calibration",
+    "inspection",
+    "testing service",
+    "validation",
+    "commissioning",
+    "subscription",
+    "saas",
+    "license",
+    "licence",
+    "renewal",
+    "support contract",
+    "cloud",
+    "hosting",
+    "maintenance agreement",
+    "maintenance plan",
+    "membership",
+    "dues",
+    "fee",
+    "fees",
+    "annual fee",
+    "subscription fee",
+    "conference",
+    "registration",
+    "seminar",
+    "webinar",
+    "training",
+    "travel",
+    "airfare",
+    "hotel",
+    "lodging",
+    "meal",
+    "per diem",
+    "car rental",
+    "rideshare",
+    "shipping",
+    "freight",
+    "courier",
+    "postage",
+    "customs brokerage",
+    "brokerage",
+    "duty",
+    "duties",
+    "tariff",
+    "fees and taxes",
+]
+
+DEFAULT_GOODS_KEYWORDS = [
+    "part",
+    "parts",
+    "component",
+    "components",
+    "assembly",
+    "unit",
+    "kit",
+    "equipment",
+    "hardware",
+    "tool",
+    "tools",
+    "machine",
+    "machinery",
+    "device",
+    "devices",
+    "spare",
+    "spares",
+    "material",
+    "materials",
+    "raw material",
+    "chemical",
+    "chemicals",
+    "resin",
+    "polymer",
+    "steel",
+    "aluminum",
+    "copper",
+    "circuit",
+    "pcb",
+    "board",
+    "boards",
+    "sensor",
+    "valve",
+    "pump",
+    "motor",
+    "bearing",
+    "fastener",
+    "screw",
+    "bolt",
+    "nut",
+    "washer",
+    "cable",
+    "wire",
+    "connector",
+    "hose",
+    "pipe",
+    "fitting",
+    "gasket",
+    "seal",
+    "packaging",
+    "box",
+    "carton",
+    "label",
+    "pallet",
+    "ink",
+    "toner",
+    "paper",
+    "office supply",
+    "supplies",
+    "glove",
+    "ppe",
+    "mask",
+    "filter",
+    "fan",
+    "compressor",
+    "rack",
+    "cart",
+]
+
+DEFAULT_IMPORT_HEAVY_KEYWORDS = [
+    "import",
+    "customs",
+    "duty",
+    "duties",
+    "tariff",
+    "incoterms",
+    "hs code",
+    "harmonized",
+    "customs clearance",
+    "brokerage",
+    "freight forwarder",
+    "ocean freight",
+    "air freight",
+]
+
+DEFAULT_DERIVED_CATEGORY_RULES: Dict[str, List[str]] = {
+    "Electronics": ["pcb", "circuit", "sensor", "connector", "cable", "wire", "board"],
+    "Machinery & Equipment": ["pump", "motor", "compressor", "machine", "machinery", "valve"],
+    "MRO / Industrial Supplies": ["bearing", "fastener", "bolt", "nut", "washer", "gasket", "seal", "tool"],
+    "Packaging": ["box", "carton", "label", "pallet", "packaging"],
+    "Chemicals": ["chemical", "chemicals", "resin", "polymer"],
+    "Facilities & Janitorial": [
+        "janitorial",
+        "cleaning",
+        "sanitation",
+        "hvac",
+        "lighting",
+        "plumbing",
+        "building material",
+        "facility",
+        "facilities",
+    ],
+}
+
+DEFAULT_WEAK_CATEGORY_LABELS = [
+    "",
+    "(blank)",
+    "blank",
+    "other",
+    "others",
+    "misc",
+    "miscellaneous",
+    "general",
+    "uncategorized",
+    "unclassified",
+    "unknown",
+    "n/a",
+    "na",
+]
+
+DEFAULT_SCORING_WEIGHTS: Dict[str, float] = {
+    # Weights for components in `direct_score`.
+    # Keep these stable: heuristics JSON can override per run.
+    "country": 0.50,
+    "goods_services": 0.30,
+    "import_heavy": 0.20,
+}
+
+
+@dataclass(frozen=True)
+class ScenarioAssumptions:
+    conservative_direct_min_score: float = 0.80
+    conservative_indirect_min_score: float = 0.70
+    conservative_indirect_multiplier: float = 0.50
+
+    base_direct_min_score: float = 0.70
+    base_indirect_min_score: float = 0.55
+    base_indirect_multiplier: float = 0.65
+
+    high_direct_min_score: float = 0.55
+    high_indirect_min_score: float = 0.40
+    high_indirect_multiplier: float = 0.85
+
+
+@dataclass
+class ColumnMap:
+    vendor: str
+    amount: str
+    description: Optional[str]
+    category: Optional[str]
+    unspsc: Optional[str]
+    country: Optional[str]
+    address: Optional[str]
+
+
+def compile_keywords_regex(keywords: List[str]) -> re.Pattern:
+    """Compile a boundary-aware regex for keyword/phrase matching.
+
+    Notes
+    -----
+    - Single-word keywords are wrapped with ``\\b`` to avoid substring false-positives
+      (e.g., ``kit`` matching ``kitchen``).
+    - Multi-word phrases are also wrapped with ``\\b`` when they start/end with word chars.
+    - Keywords starting/ending with non-word characters are not wrapped.
+    """
+    cleaned = sorted({k.strip() for k in keywords if k and k.strip()}, key=len, reverse=True)
+    if not cleaned:
+        return re.compile(r"$^")
+    parts: List[str] = []
+    for k in cleaned:
+        esc = re.escape(k)
+        is_single_word = bool(re.fullmatch(r"\w+", k))
+        starts_word = bool(re.match(r"^\w", k))
+        ends_word = bool(re.match(r".*\w$", k))
+        if is_single_word or (starts_word and ends_word):
+            parts.append(r"\b" + esc + r"\b")
+        else:
+            parts.append(esc)
+    return re.compile(r"(" + "|".join(parts) + r")", flags=re.IGNORECASE)
+
+
+def compile_category_rules(rules: Dict[str, List[str]]) -> List[Tuple[str, re.Pattern]]:
+    compiled: List[Tuple[str, re.Pattern]] = []
+    for category, keywords in rules.items():
+        compiled.append((category, compile_keywords_regex(keywords)))
+    return compiled
+
+
+def _first_existing_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    """Return first matching column name from candidates with case-insensitive fallback."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    lower_map = {str(col).strip().lower(): col for col in df.columns}
+    for c in candidates:
+        hit = lower_map.get(str(c).strip().lower())
+        if hit is not None:
+            return hit
+    return None
+
+
+def _parse_unspsc_prefix2(unspsc_value: object) -> str:
+    digits = re.sub(r"\D", "", "" if pd.isna(unspsc_value) else str(unspsc_value))
+    return digits[:2] if len(digits) >= 2 else ""
+
+
+def _to_float_series(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.strip()
+    s = s.str.replace(r"[\$,]", "", regex=True)
+    # Simple EU-format heuristic: if both '.' and ',' exist and ',' appears after '.', treat '.' as thousands and ',' as decimal.
+    both = s.str.contains(r"\.") & s.str.contains(r",")
+    s_eu = s.where(~both, s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+    # If only comma exists, it might be decimal separator; try parse both ways by replacing comma with dot.
+    only_comma = s_eu.str.contains(r",") & ~s_eu.str.contains(r"\.")
+    s_eu = s_eu.where(~only_comma, s_eu.str.replace(",", ".", regex=False))
+    out = pd.to_numeric(s_eu, errors="coerce").fillna(0.0)
+    return out.astype(float)
+
+
+def _normalize_text_series(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip().str.lower()
+
+
+def vendor_group(name: str, suffix_re: re.Pattern) -> str:
+    """Parent vendors by stripping common legal suffixes and collapsing whitespace."""
+    if not name:
+        return ""
+    s = re.sub(r"\s+", " ", name.strip())
+    s = suffix_re.sub("", s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def vendor_group_series(series: pd.Series, suffix_re: re.Pattern) -> pd.Series:
+    """Vectorized wrapper around :func:`vendor_group` for vendor parenting."""
+    s = series.fillna("").astype(str)
+    return s.map(lambda x: vendor_group(x, suffix_re))
+
+
+def contains_any_series(text_blob: pd.Series, regex: re.Pattern) -> pd.Series:
+    return text_blob.str.contains(regex, na=False)
+
+
+def resolve_input_files(input_dir: str, patterns: List[str], explicit_inputs: List[str]) -> List[str]:
+    files: List[str] = []
+    files.extend([p for p in explicit_inputs if p])
+    if input_dir:
+        pats = patterns if patterns else ["*.csv"]
+        for pat in pats:
+            files.extend(glob.glob(os.path.join(input_dir, pat)))
+    files = sorted({os.path.abspath(f) for f in files})
+    if not files:
+        raise SystemExit("No input files found. Use --inputs and/or --input-dir/--patterns.")
+    return files
+
+
+def detect_columns(df: pd.DataFrame, amount_override: Optional[str] = None) -> ColumnMap:
+    vendor = _first_existing_col(df, VENDOR_COL_CANDIDATES)
+    if vendor is None:
+        raise SystemExit(f"Could not detect vendor column. Candidates tried: {VENDOR_COL_CANDIDATES}")
+
+    if amount_override:
+        amount = amount_override
+        if amount not in df.columns:
+            # case-insensitive fallback
+            lower_map = {str(col).strip().lower(): col for col in df.columns}
+            hit = lower_map.get(str(amount_override).strip().lower())
+            if hit is None:
+                raise SystemExit(f"--amount-col '{amount_override}' not found in columns.")
+            amount = hit
+    else:
+        amount = _first_existing_col(df, AMOUNT_COL_CANDIDATES)
+        if amount is None:
+            raise SystemExit(f"Could not detect amount column. Candidates tried: {AMOUNT_COL_CANDIDATES}")
+
+    description = _first_existing_col(df, DESC_COL_CANDIDATES)
+    category = _first_existing_col(df, CATEGORY_COL_CANDIDATES)
+    unspsc = _first_existing_col(df, UNSPSC_COL_CANDIDATES)
+    country = _first_existing_col(df, COUNTRY_COL_CANDIDATES)
+    address = _first_existing_col(df, ADDRESS_COL_CANDIDATES)
+
+    return ColumnMap(
+        vendor=vendor,
+        amount=amount,
+        description=description,
+        category=category,
+        unspsc=unspsc,
+        country=country,
+        address=address,
+    )
+
+
+def build_text_blob(
+    df: pd.DataFrame, cols: ColumnMap, include_vendor: bool = True, include_category: bool = True
+) -> pd.Series:
+    parts: List[pd.Series] = []
+    if include_vendor and cols.vendor in df.columns:
+        parts.append(_normalize_text_series(df[cols.vendor]))
+    if cols.description and cols.description in df.columns:
+        parts.append(_normalize_text_series(df[cols.description]))
+    if include_category and cols.category and cols.category in df.columns:
+        parts.append(_normalize_text_series(df[cols.category]))
+    if cols.country and cols.country in df.columns:
+        parts.append(_normalize_text_series(df[cols.country]))
+    if cols.address and cols.address in df.columns:
+        parts.append(_normalize_text_series(df[cols.address]))
+
+    if not parts:
+        return pd.Series([""] * len(df), index=df.index, dtype=str)
+    blob = parts[0]
+    for p in parts[1:]:
+        blob = blob + " " + p
+    blob = blob.str.replace(r"\s+", " ", regex=True).str.strip()
+    return blob
+
+
+def classify_goods_services_vectorized(
+    df: pd.DataFrame,
+    text_blob: pd.Series,
+    service_re: re.Pattern,
+    goods_re: re.Pattern,
+    unspsc_col: Optional[str],
+) -> Tuple[pd.Series, pd.Series]:
+    service_hit = contains_any_series(text_blob, service_re)
+    goods_hit = contains_any_series(text_blob, goods_re)
+
+    service_unspsc = pd.Series([False] * len(df), index=df.index)
+    goods_unspsc = pd.Series([False] * len(df), index=df.index)
+    if unspsc_col and unspsc_col in df.columns:
+        prefix2 = df[unspsc_col].map(_parse_unspsc_prefix2)
+        # UNSPSC 80-94 are mostly services; 10-60 mostly goods.
+        service_unspsc = prefix2.isin([str(i) for i in range(80, 95)])
+        goods_unspsc = prefix2.isin([str(i).zfill(2) for i in range(10, 61)])
+
+    # If both hit, defaulting to GOODS inflates exposure.
+    # Tie-break: if UNSPSC signals services, treat as service; else if UNSPSC signals goods, treat as goods;
+    # else prefer service when a service keyword hit exists (more conservative for tariff exposure).
+    both = service_hit & goods_hit
+    service = (service_hit & ~goods_hit) | (both & service_unspsc) | (both & ~goods_unspsc & ~service_unspsc)
+    goods = (goods_hit & ~service_hit) | (both & goods_unspsc)
+
+    # UNSPSC-only fallback where no keyword hit exists
+    service = service | (service_unspsc & ~goods_hit & ~service_hit)
+    goods = goods | (goods_unspsc & ~goods_hit & ~service_hit)
+
+    return goods.astype(bool), service.astype(bool)
+
+
+def derived_category_vectorized(
+    df: pd.DataFrame, text_blob: pd.Series, compiled_rules: List[Tuple[str, re.Pattern]]
+) -> pd.Series:
+    out = pd.Series([""] * len(df), index=df.index, dtype=str)
+    for cat, regex in compiled_rules:
+        hit = contains_any_series(text_blob, regex)
+        out = out.where(~hit | (out != ""), cat)
+    return out
+
+
+def direct_score_vectorized(
+    df: pd.DataFrame,
+    text_blob: pd.Series,
+    goods: pd.Series,
+    service: pd.Series,
+    import_heavy_re: re.Pattern,
+    country_col: Optional[str],
+    address_col: Optional[str],
+    scoring_weights: Dict[str, float],
+) -> pd.Series:
+    country_w = float(scoring_weights.get("country", 0.50))
+    gs_w = float(scoring_weights.get("goods_services", 0.30))
+    imp_w = float(scoring_weights.get("import_heavy", 0.20))
+
+    # Country signal: non-US increases score; US decreases score.
+    ccat_norm = pd.Series([""] * len(df), index=df.index, dtype=str)
+    if country_col and country_col in df.columns:
+        ccat_norm = _normalize_text_series(df[country_col])
+    addr_norm = pd.Series([""] * len(df), index=df.index, dtype=str)
+    if address_col and address_col in df.columns:
+        addr_norm = _normalize_text_series(df[address_col])
+
+    is_us = ccat_norm.str.contains(r"\b(united\s+states|usa|u\.s\.a?\.?|us)\b", regex=True, na=False)
+    has_country_text = ccat_norm.str.contains(r"[a-z]", na=False)
+
+    addr_is_us = addr_norm.str.contains(r"\b(united\s+states|usa|u\.s\.a?\.?|us)\b", regex=True, na=False)
+
+    country_score = np.where(has_country_text, np.where(is_us, 0.0, 1.0), np.where(addr_is_us, 0.0, 0.5))
+    country_score = pd.Series(country_score, index=df.index, dtype=float)
+
+    # Goods/services: goods are more exposed than services
+    gs_score = np.where(goods, 1.0, np.where(service, 0.0, 0.5))
+    gs_score = pd.Series(gs_score, index=df.index, dtype=float)
+
+    import_score = contains_any_series(text_blob, import_heavy_re).astype(float)
+
+    score = country_w * country_score + gs_w * gs_score + imp_w * import_score
+    return score.clip(0.0, 1.0).astype(float)
+
+
+def scenario_exposure_bases(
+    amount: pd.Series, score: pd.Series, goods: pd.Series, service: pd.Series, assumptions: ScenarioAssumptions
+) -> Dict[str, pd.Series]:
+    # Direct exposure: only when score above threshold and line looks like goods.
+    def direct_fraction(min_score: float) -> pd.Series:
+        return ((score >= min_score) & goods).astype(float)
+
+    # Indirect exposure: when score above a lower threshold and line looks like goods OR ambiguous; scaled by multiplier.
+    def indirect_fraction(min_score: float, multiplier: float) -> pd.Series:
+        return ((score >= min_score) & ~service).astype(float) * float(multiplier)
+
+    cons_direct = direct_fraction(assumptions.conservative_direct_min_score)
+    cons_indir = indirect_fraction(assumptions.conservative_indirect_min_score, assumptions.conservative_indirect_multiplier)
+
+    base_direct = direct_fraction(assumptions.base_direct_min_score)
+    base_indir = indirect_fraction(assumptions.base_indirect_min_score, assumptions.base_indirect_multiplier)
+
+    high_direct = direct_fraction(assumptions.high_direct_min_score)
+    high_indir = indirect_fraction(assumptions.high_indirect_min_score, assumptions.high_indirect_multiplier)
+
+    # High scenario uses max (not sum) to avoid double counting.
+    high_total_frac = pd.concat([high_direct, high_indir], axis=1).max(axis=1)
+
+    return {
+        "conservative_direct_base": amount * cons_direct,
+        "conservative_indirect_base": amount * cons_indir,
+        "conservative_total_base": amount * (cons_direct + cons_indir),
+        "base_direct_base": amount * base_direct,
+        "base_indirect_base": amount * base_indir,
+        "base_total_base": amount * (base_direct + base_indir),
+        "high_direct_base": amount * high_direct,
+        "high_indirect_base": amount * high_indir,
+        "high_total_base": amount * high_total_frac,
+    }
+
+
+def safe_sheet_name(name: str) -> str:
+    s = re.sub(r"[\[\]\*:/\\\?]", " ", name)
+    s = re.sub(r"\s+", " ", s).strip()
+    return (s[:31] or "Sheet")
+
+
+def write_log(outdir: str, lines: List[str]) -> None:
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "run_log.txt"), "w", encoding="utf-8") as f:
+        for ln in lines:
+            f.write(ln.rstrip() + "\n")
+
+
+def load_heuristics(path: Optional[str]) -> Dict[str, object]:
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def read_csv_chunked(
+    file_path: str,
+    chunksize: int,
+    encoding: str,
+    on_bad_lines: str,
+) -> Iterator[pd.DataFrame]:
+    encodings = [encoding] if encoding != "auto" else ["utf-8-sig", "utf-8", "cp1252", "latin1"]
+    last_err: Optional[Exception] = None
+    for enc in encodings:
+        try:
+            yield from pd.read_csv(
+                file_path,
+                chunksize=chunksize,
+                dtype=str,
+                encoding=enc,
+                on_bad_lines=on_bad_lines,
+                low_memory=False,
+            )
+            return
+        except Exception as e:  # pragma: no cover
+            last_err = e
+    raise SystemExit(f"Failed reading CSV {file_path}. Last error: {last_err}") from last_err
+
+
+def build_vendor_suffix_regex(extra_suffixes: Optional[List[str]] = None) -> re.Pattern:
+    suffixes = [
+        "inc",
+        "inc.",
+        "llc",
+        "l.l.c",
+        "ltd",
+        "ltd.",
+        "limited",
+        "corp",
+        "corp.",
+        "corporation",
+        "co",
+        "co.",
+        "company",
+        "gmbh",
+        "ag",
+        "sa",
+        "s.a.",
+        "sarl",
+        "plc",
+        "pte",
+        "pte.",
+        "bv",
+        "b.v.",
+        "oy",
+        "oyj",
+        "kg",
+        "kgaa",
+        "sp",
+        "spa",
+        "s.p.a.",
+    ]
+    if extra_suffixes:
+        suffixes.extend([s.strip().lower() for s in extra_suffixes if s and s.strip()])
+    suffixes = sorted(set(suffixes), key=len, reverse=True)
+    pat = r"(?:,?\s+(?:" + "|".join(re.escape(s) for s in suffixes) + r")\.?)$"
+    return re.compile(pat, flags=re.IGNORECASE)
+
+
+def clean_for_excel(value: object) -> object:
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value
+
+
+def set_column_widths(ws, df: pd.DataFrame, max_width: int = 60) -> None:
+    for i, col in enumerate(df.columns, start=1):
+        best = len(str(col))
+        if len(df) > 0:
+            sample = df[col].astype(str).head(200)
+            best = max(best, int(sample.map(len).max()))
+        ws.column_dimensions[get_column_letter(i)].width = min(max_width, max(10, best + 2))
+
+
+def style_header(ws, row: int = 1) -> None:
+    fill = PatternFill("solid", fgColor="1F4E79")
+    font = Font(color="FFFFFF", bold=True)
+    border = Border(bottom=Side(style="thin", color="A6A6A6"))
+    for cell in ws[row]:
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+
+
+def freeze(ws, row: int = 2, col: int = 1) -> None:
+    ws.freeze_panes = ws.cell(row=row, column=col)
+
+
+def add_filters(ws, df: pd.DataFrame) -> None:
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df) + 1}"
+
+
+def write_df(ws, df: pd.DataFrame) -> None:
+    ws.append(list(df.columns))
+    for _, row in df.iterrows():
+        ws.append([clean_for_excel(v) for v in row.tolist()])
+
+
+def add_bar_chart(ws, title: str, data_col: int, cat_col: int, start_row: int, end_row: int, anchor: str) -> None:
+    chart = BarChart()
+    chart.title = title
+    chart.type = "col"
+    chart.style = 10
+    chart.y_axis.title = "USD"
+    chart.x_axis.title = ""
+    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
+    cats = Reference(ws, min_col=cat_col, min_row=start_row + 1, max_row=end_row)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    chart.height = 8
+    chart.width = 18
+    ws.add_chart(chart, anchor)
+
+
+def write_excel_report(
+    out_path: str,
+    summary: Dict[str, object],
+    top_suppliers: pd.DataFrame,
+    top_categories: pd.DataFrame,
+    preview_lines: pd.DataFrame,
+) -> None:
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    ws0 = wb.create_sheet("Executive Summary")
+    summary_items = [(k, v) for k, v in summary.items()]
+    df_sum = pd.DataFrame(summary_items, columns=["Metric", "Value"])
+    write_df(ws0, df_sum)
+    style_header(ws0)
+    set_column_widths(ws0, df_sum, max_width=70)
+    freeze(ws0)
+
+    ws1 = wb.create_sheet("Top Suppliers")
+    write_df(ws1, top_suppliers)
+    style_header(ws1)
+    set_column_widths(ws1, top_suppliers)
+    freeze(ws1)
+    add_filters(ws1, top_suppliers)
+
+    ws2 = wb.create_sheet("Top Categories")
+    write_df(ws2, top_categories)
+    style_header(ws2)
+    set_column_widths(ws2, top_categories)
+    freeze(ws2)
+    add_filters(ws2, top_categories)
+
+    ws3 = wb.create_sheet("Scored Lines (Preview)")
+    write_df(ws3, preview_lines)
+    style_header(ws3)
+    set_column_widths(ws3, preview_lines)
+    freeze(ws3)
+    add_filters(ws3, preview_lines)
+
+    wb.save(out_path)
+
+
+def run(
+    input_files: List[str],
+    outdir: str,
+    calendar_year: int,
+    tariff_rate: float,
+    assumptions: ScenarioAssumptions,
+    chunksize: int = 200_000,
+    excel: bool = True,
+    excel_name: str = "tariff_executive_report.xlsx",
+    write_scored_csv: bool = False,
+    excel_data_preview_rows: int = 50_000,
+    expected_total_spend: Optional[float] = None,
+    amount_col: Optional[str] = None,
+    heuristics_path: Optional[str] = None,
+    top_n: int = 25,
+    encoding: str = "auto",
+    on_bad_lines: str = "error",
+    log_every: int = 0,
+) -> None:
+    os.makedirs(outdir, exist_ok=True)
+
+    h = load_heuristics(heuristics_path)
+    service_keywords = h.get("service_keywords", DEFAULT_SERVICE_KEYWORDS)
+    goods_keywords = h.get("goods_keywords", DEFAULT_GOODS_KEYWORDS)
+    import_heavy_keywords = h.get("import_heavy_keywords", DEFAULT_IMPORT_HEAVY_KEYWORDS)
+    vendor_suffixes = h.get("vendor_suffixes", [])
+    derived_category_rules = h.get("derived_category_rules", DEFAULT_DERIVED_CATEGORY_RULES)
+    weak_category_labels = {str(x).strip().lower() for x in h.get("weak_category_labels", DEFAULT_WEAK_CATEGORY_LABELS)}
+    scoring_weights = {**DEFAULT_SCORING_WEIGHTS, **h.get("scoring_weights", {})}
+
+    SERVICE_RE = compile_keywords_regex(service_keywords)
+    GOODS_RE = compile_keywords_regex(goods_keywords)
+    IMPORT_HEAVY_RE = compile_keywords_regex(import_heavy_keywords)
+    compiled_category_rules = compile_category_rules(derived_category_rules)
+    vendor_suffix_re = build_vendor_suffix_regex(vendor_suffixes)
+
+    log: List[str] = []
+    log.append(f"Run date: {datetime.now().isoformat(timespec='seconds')}")
+    log.append(f"Calendar year label: {calendar_year}")
+    log.append(f"Tariff rate: {tariff_rate:.4f}")
+    log.append(f"Assumptions: {asdict(assumptions)}")
+    log.append(f"Input files: {len(input_files)}")
+    for f in input_files:
+        log.append(f" - {f}")
+
+    total_rows = 0
+    total_spend = 0.0
+    amount_parse_zero = 0
+    missing_vendor = 0
+
+    supplier_agg: Dict[str, float] = {}
+    category_agg: Dict[str, float] = {}
+
+    preview_frames: List[pd.DataFrame] = []
+    scored_out_path = os.path.join(outdir, "tariff_lines_scored.csv")
+    scored_out_written = False
+
+    for file_i, file_path in enumerate(input_files, start=1):
+        first_chunk = True
+        for chunk_i, df in enumerate(read_csv_chunked(file_path, chunksize, encoding, on_bad_lines), start=1):
+            if first_chunk:
+                cols = detect_columns(df, amount_override=amount_col)
+                first_chunk = False
+                log.append(f"[{os.path.basename(file_path)}] Column map: {cols}")
+
+            df = df.copy()
+
+            vendor_raw = df[cols.vendor].fillna("").astype(str)
+            amount = _to_float_series(df[cols.amount])
+
+            total_rows += len(df)
+            total_spend += float(amount.sum())
+            amount_parse_zero += int((amount == 0).sum())
+            missing_vendor += int((vendor_raw.str.strip() == "").sum())
+
+            text_blob = build_text_blob(df, cols)
+            goods_flag, service_flag = classify_goods_services_vectorized(df, text_blob, SERVICE_RE, GOODS_RE, cols.unspsc)
+
+            derived_category = derived_category_vectorized(df, text_blob, compiled_category_rules)
+
+            cat_raw = pd.Series([""] * len(df), index=df.index, dtype=str)
+            if cols.category and cols.category in df.columns:
+                cat_raw = _normalize_text_series(df[cols.category])
+
+            use_derived = cat_raw.isin(weak_category_labels) | (cat_raw == "")
+            category_final = cat_raw.where(~use_derived, derived_category)
+            category_final = category_final.replace("", "Uncategorized")
+
+            score = direct_score_vectorized(
+                df=df,
+                text_blob=text_blob,
+                goods=goods_flag,
+                service=service_flag,
+                import_heavy_re=IMPORT_HEAVY_RE,
+                country_col=cols.country,
+                address_col=cols.address,
+                scoring_weights=scoring_weights,
+            )
+
+            bases = scenario_exposure_bases(amount, score, goods_flag, service_flag, assumptions)
+
+            vendor_parent = vendor_group_series(vendor_raw, vendor_suffix_re)
+
+            exposed_base = bases["base_total_base"]
+
+            # aggregate
+            for v, val in zip(vendor_parent.tolist(), exposed_base.tolist()):
+                supplier_agg[v] = supplier_agg.get(v, 0.0) + float(val)
+            for c, val in zip(category_final.tolist(), exposed_base.tolist()):
+                category_agg[c] = category_agg.get(c, 0.0) + float(val)
+
+            # preview lines
+            if sum(len(x) for x in preview_frames) < excel_data_preview_rows:
+                preview = pd.DataFrame(
+                    {
+                        "vendor_raw": vendor_raw,
+                        "vendor_parent": vendor_parent,
+                        "amount": amount,
+                        "category": category_final,
+                        "goods_flag": goods_flag,
+                        "service_flag": service_flag,
+                        "direct_score": score,
+                        "base_exposed": exposed_base,
+                    }
+                )
+                if cols.description and cols.description in df.columns:
+                    preview.insert(2, "description", df[cols.description].fillna("").astype(str))
+                if cols.country and cols.country in df.columns:
+                    preview["country"] = df[cols.country].fillna("").astype(str)
+                preview_frames.append(preview.head(max(0, excel_data_preview_rows - sum(len(x) for x in preview_frames))))
+
+            if write_scored_csv:
+                out_df = pd.DataFrame(
+                    {
+                        "vendor_raw": vendor_raw,
+                        "vendor_parent": vendor_parent,
+                        "amount": amount,
+                        "category": category_final,
+                        "goods_flag": goods_flag.astype(int),
+                        "service_flag": service_flag.astype(int),
+                        "direct_score": score,
+                        **bases,
+                    }
+                )
+                if cols.description and cols.description in df.columns:
+                    out_df["description"] = df[cols.description].fillna("").astype(str)
+                mode = "w" if not scored_out_written else "a"
+                header = not scored_out_written
+                out_df.to_csv(scored_out_path, index=False, mode=mode, header=header)
+                scored_out_written = True
+
+            if log_every and (chunk_i % log_every == 0):
+                log.append(
+                    f"[{os.path.basename(file_path)}] chunk {chunk_i}: rows={len(df)} "
+                    f"total_rows={total_rows} total_spend={total_spend:,.0f}"
+                )
+
+    # rollups
+    top_suppliers_df = (
+        pd.DataFrame({"vendor_parent": list(supplier_agg.keys()), "base_exposed": list(supplier_agg.values())})
+        .sort_values("base_exposed", ascending=False)
+        .head(int(top_n))
+        .reset_index(drop=True)
+    )
+    top_categories_df = (
+        pd.DataFrame({"category": list(category_agg.keys()), "base_exposed": list(category_agg.values())})
+        .sort_values("base_exposed", ascending=False)
+        .head(int(top_n))
+        .reset_index(drop=True)
+    )
+
+    # summary
+    base_total = float(top_categories_df["base_exposed"].sum()) if len(top_categories_df) else 0.0
+    summary = {
+        "calendar_year": calendar_year,
+        "tariff_rate": tariff_rate,
+        "total_rows": int(total_rows),
+        "total_spend": float(total_spend),
+        "base_exposed_spend_top_categories_sum": float(base_total),
+        "estimated_tariff_cost_base_top_categories_sum": float(base_total * float(tariff_rate)),
+        "amount_parse_zero_rate": float(amount_parse_zero / max(1, total_rows)),
+        "missing_vendor_rate": float(missing_vendor / max(1, total_rows)),
+    }
+    if expected_total_spend is not None and expected_total_spend > 0:
+        summary["coverage_pct_vs_expected"] = float(total_spend / expected_total_spend)
+
+    # write outputs
+    with open(os.path.join(outdir, "tariff_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    top_suppliers_df.to_csv(os.path.join(outdir, "top_suppliers_base.csv"), index=False)
+    top_categories_df.to_csv(os.path.join(outdir, "top_categories_base.csv"), index=False)
+
+    preview_lines = pd.concat(preview_frames, ignore_index=True) if preview_frames else pd.DataFrame()
+
+    if excel:
+        excel_path = os.path.join(outdir, excel_name)
+        write_excel_report(
+            out_path=excel_path,
+            summary=summary,
+            top_suppliers=top_suppliers_df,
+            top_categories=top_categories_df,
+            preview_lines=preview_lines,
+        )
+        log.append(f"Wrote Excel: {excel_path}")
+
+    write_log(outdir, log)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Tariff exposure estimator (proxy) + polished Excel report (chunked).")
+    p.add_argument("--inputs", nargs="*", default=[], help="Explicit input CSV paths (optional).")
+    p.add_argument("--input-dir", default="", help="Directory containing input CSVs.")
+    p.add_argument("--patterns", nargs="*", default=[], help="Glob patterns within input-dir.")
+    p.add_argument("--outdir", required=True, help="Output directory.")
+    p.add_argument("--calendar-year", type=int, default=date.today().year, help="Calendar year label for the report.")
+    p.add_argument("--tariff-rate", type=float, default=0.10, help="Tariff rate (e.g., 0.10 for 10%).")
+
+    p.add_argument("--chunksize", type=int, default=200_000, help="Rows per chunk for large CSVs.")
+    p.add_argument("--excel", action="store_true", help="Write executive Excel report.")
+    p.add_argument("--excel-name", default="tariff_executive_report.xlsx", help="Excel filename within outdir.")
+    p.add_argument("--write-scored-csv", action="store_true", help="Write full scored lines CSV (big).")
+    p.add_argument("--excel-data-preview-rows", type=int, default=50_000, help="Rows to include in Excel preview.")
+    p.add_argument("--top-n", dest="top_n", type=int, default=25, help="Top N suppliers/categories to show in rollups.")
+
+    p.add_argument("--encoding", default="auto", help="CSV encoding: auto, cp1252, latin1, utf-8-sig, utf-8, etc.")
+    p.add_argument("--on-bad-lines", default="error", choices=["error", "warn", "skip"], help="Malformed row handling.")
+    p.add_argument("--log-every", type=int, default=0, help="Log progress every N chunks (0 disables).")
+
+    p.add_argument("--expected-total-spend", type=float, default=None, help="Optional expected CY total (for coverage %).")
+    p.add_argument("--amount-col", default=None, help="Optional override for the spend column name.")
+    p.add_argument("--heuristics", default=None, help="Optional heuristics JSON path.")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    input_files = resolve_input_files(args.input_dir, args.patterns, args.inputs)
+    assumptions = ScenarioAssumptions()
+    run(
+        input_files=input_files,
+        outdir=args.outdir,
+        calendar_year=args.calendar_year,
+        tariff_rate=args.tariff_rate,
+        assumptions=assumptions,
+        chunksize=args.chunksize,
+        excel=args.excel,
+        excel_name=args.excel_name,
+        write_scored_csv=args.write_scored_csv,
+        excel_data_preview_rows=args.excel_data_preview_rows,
+        expected_total_spend=args.expected_total_spend,
+        amount_col=args.amount_col,
+        heuristics_path=args.heuristics,
+        top_n=args.top_n,
+        encoding=args.encoding,
+        on_bad_lines=args.on_bad_lines,
+        log_every=args.log_every,
+    )
+
+
+if __name__ == "__main__":
+    main()
