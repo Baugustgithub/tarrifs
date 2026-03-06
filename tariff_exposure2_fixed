@@ -769,39 +769,184 @@ def add_bar_chart(ws, title: str, data_col: int, cat_col: int, start_row: int, e
 def write_excel_report(
     out_path: str,
     summary: Dict[str, object],
-    top_suppliers: pd.DataFrame,
-    top_categories: pd.DataFrame,
+    top_suppliers: Dict[str, pd.DataFrame],
+    top_categories: Dict[str, pd.DataFrame],
     preview_lines: pd.DataFrame,
 ) -> None:
     wb = Workbook()
     wb.remove(wb.active)
 
+    ws_m = wb.create_sheet("Methodology")
+    ws_m.merge_cells("A1:D1")
+    ws_m["A1"] = "Tariff Exposure Methodology"
+    ws_m["A1"].font = Font(size=15, bold=True, color="FFFFFF")
+    ws_m["A1"].fill = PatternFill("solid", fgColor="1F4E79")
+    ws_m["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws_m.row_dimensions[1].height = 30
+
+    methodology_rows = [
+        ("Direct Exposure", "Goods-like lines above score thresholds and likely non-US origin."),
+        (
+            "Indirect Exposure",
+            "Non-service or ambiguous lines above indirect thresholds use pass-through multipliers.",
+        ),
+        (
+            "Scoring",
+            "Weighted score = country signal (50%) + goods/services (30%) + import-heavy keywords (20%).",
+        ),
+        ("Formula", "Tariff Impact = Exposed Spend x Tariff Rate"),
+        (
+            "Conservative",
+            f"Direct >= {summary['assumptions']['conservative_direct_min_score']}, "
+            f"Indirect >= {summary['assumptions']['conservative_indirect_min_score']}, "
+            f"Multiplier = {summary['assumptions']['conservative_indirect_multiplier']}",
+        ),
+        (
+            "Base",
+            f"Direct >= {summary['assumptions']['base_direct_min_score']}, "
+            f"Indirect >= {summary['assumptions']['base_indirect_min_score']}, "
+            f"Multiplier = {summary['assumptions']['base_indirect_multiplier']}",
+        ),
+        (
+            "High",
+            f"Direct >= {summary['assumptions']['high_direct_min_score']}, "
+            f"Indirect >= {summary['assumptions']['high_indirect_min_score']}, "
+            f"Multiplier = {summary['assumptions']['high_indirect_multiplier']}",
+        ),
+    ]
+    ws_m.append(["Section", "Details", "", ""])  # row 2 header
+    for sec, details in methodology_rows:
+        ws_m.append([sec, details, "", ""])
+    style_header(ws_m, row=2)
+    ws_m.column_dimensions["A"].width = 24
+    ws_m.column_dimensions["B"].width = 110
+    for row in ws_m.iter_rows(min_row=3, max_col=2):
+        row[1].alignment = Alignment(wrap_text=True, vertical="top")
+    freeze(ws_m, row=3)
+
     ws0 = wb.create_sheet("Executive Summary")
-    summary_items = [(k, v) for k, v in summary.items()]
+    ws0.merge_cells("A1:C1")
+    ws0["A1"] = "Executive Tariff Summary"
+    ws0["A1"].font = Font(size=15, bold=True, color="FFFFFF")
+    ws0["A1"].fill = PatternFill("solid", fgColor="1F4E79")
+    ws0["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+    ws0["A3"] = "Conservative Tariff Impact"
+    ws0["B3"] = summary.get("estimated_tariff_cost_conservative_top_categories_sum", 0.0)
+    ws0["A4"] = "Base Tariff Impact"
+    ws0["B4"] = summary.get("estimated_tariff_cost_base_top_categories_sum", 0.0)
+    ws0["A5"] = "High Tariff Impact"
+    ws0["B5"] = summary.get("estimated_tariff_cost_high_top_categories_sum", 0.0)
+    for card_row, color in [(3, "D9EAD3"), (4, "CFE2F3"), (5, "F4CCCC")]:
+        ws0[f"A{card_row}"].font = Font(bold=True)
+        ws0[f"A{card_row}"].fill = PatternFill("solid", fgColor=color)
+        ws0[f"B{card_row}"].fill = PatternFill("solid", fgColor=color)
+        ws0[f"B{card_row}"].number_format = '"$"#,##0'
+
+    summary_items = [(k, v) for k, v in summary.items() if k != "assumptions"]
     df_sum = pd.DataFrame(summary_items, columns=["Metric", "Value"])
-    write_df(ws0, df_sum)
-    style_header(ws0)
+    ws0["A7"] = "Metric"
+    ws0["B7"] = "Value"
+    ws0["C7"] = ""
+    for i, (_, row) in enumerate(df_sum.iterrows(), start=8):
+        ws0.cell(row=i, column=1, value=clean_for_excel(row["Metric"]))
+        ws0.cell(row=i, column=2, value=clean_for_excel(row["Value"]))
+        ws0.cell(row=i, column=3, value="")
+    style_header(ws0, row=7)
     set_column_widths(ws0, df_sum, max_width=70)
-    freeze(ws0)
+    for row_i in range(8, 8 + len(df_sum)):
+        metric = str(ws0.cell(row=row_i, column=1).value).lower()
+        cell = ws0.cell(row=row_i, column=2)
+        if isinstance(cell.value, (int, float)):
+            if "rate" in metric or "pct" in metric:
+                cell.number_format = "0.00%"
+            elif "cost" in metric or "spend" in metric:
+                cell.number_format = '"$"#,##0'
+    freeze(ws0, row=8)
 
     ws1 = wb.create_sheet("Top Suppliers")
-    write_df(ws1, top_suppliers)
+    top_suppliers_merged = pd.DataFrame({"vendor_parent": []})
+    for scenario_key in ["conservative", "base", "high"]:
+        col_name = f"{scenario_key}_exposed"
+        df_s = top_suppliers[scenario_key][["vendor_parent", col_name]].rename(columns={col_name: scenario_key.capitalize()})
+        if top_suppliers_merged.empty:
+            top_suppliers_merged = df_s
+        else:
+            top_suppliers_merged = top_suppliers_merged.merge(df_s, on="vendor_parent", how="outer")
+    top_suppliers_merged = top_suppliers_merged.fillna(0.0).sort_values("Base", ascending=False).head(len(top_suppliers_merged))
+
+    write_df(ws1, top_suppliers_merged)
     style_header(ws1)
-    set_column_widths(ws1, top_suppliers)
+    set_column_widths(ws1, top_suppliers_merged)
+    for col_letter in ["B", "C", "D"]:
+        for cell in ws1[col_letter][1:]:
+            cell.number_format = '"$"#,##0'
+        ws1.conditional_formatting.add(
+            f"{col_letter}2:{col_letter}{len(top_suppliers_merged)+1}",
+            ColorScaleRule(start_type="min", start_color="FFFFFF", mid_type="percentile", mid_value=50, mid_color="FFF2CC", end_type="max", end_color="EA9999"),
+        )
+    if len(top_suppliers_merged) > 0:
+        add_bar_chart(
+            ws1,
+            "Top Suppliers (Base Exposure)",
+            data_col=3,
+            cat_col=1,
+            start_row=1,
+            end_row=min(len(top_suppliers_merged) + 1, 11),
+            anchor="F2",
+        )
     freeze(ws1)
-    add_filters(ws1, top_suppliers)
+    add_filters(ws1, top_suppliers_merged)
 
     ws2 = wb.create_sheet("Top Categories")
-    write_df(ws2, top_categories)
+    top_categories_merged = pd.DataFrame({"category": []})
+    for scenario_key in ["conservative", "base", "high"]:
+        col_name = f"{scenario_key}_exposed"
+        df_c = top_categories[scenario_key][["category", col_name]].rename(columns={col_name: scenario_key.capitalize()})
+        if top_categories_merged.empty:
+            top_categories_merged = df_c
+        else:
+            top_categories_merged = top_categories_merged.merge(df_c, on="category", how="outer")
+    top_categories_merged = top_categories_merged.fillna(0.0).sort_values("Base", ascending=False).head(len(top_categories_merged))
+
+    write_df(ws2, top_categories_merged)
     style_header(ws2)
-    set_column_widths(ws2, top_categories)
+    set_column_widths(ws2, top_categories_merged)
+    for col_letter in ["B", "C", "D"]:
+        for cell in ws2[col_letter][1:]:
+            cell.number_format = '"$"#,##0'
+        ws2.conditional_formatting.add(
+            f"{col_letter}2:{col_letter}{len(top_categories_merged)+1}",
+            ColorScaleRule(start_type="min", start_color="FFFFFF", mid_type="percentile", mid_value=50, mid_color="FFF2CC", end_type="max", end_color="EA9999"),
+        )
+    if len(top_categories_merged) > 0:
+        add_bar_chart(
+            ws2,
+            "Top Categories (Base Exposure)",
+            data_col=3,
+            cat_col=1,
+            start_row=1,
+            end_row=min(len(top_categories_merged) + 1, 11),
+            anchor="F2",
+        )
     freeze(ws2)
-    add_filters(ws2, top_categories)
+    add_filters(ws2, top_categories_merged)
 
     ws3 = wb.create_sheet("Scored Lines (Preview)")
     write_df(ws3, preview_lines)
     style_header(ws3)
     set_column_widths(ws3, preview_lines)
+    if "direct_score" in preview_lines.columns and len(preview_lines) > 0:
+        score_col = get_column_letter(preview_lines.columns.get_loc("direct_score") + 1)
+        ws3.conditional_formatting.add(
+            f"{score_col}2:{score_col}{len(preview_lines)+1}",
+            ColorScaleRule(start_type="min", start_color="F4CCCC", mid_type="percentile", mid_value=50, mid_color="FFF2CC", end_type="max", end_color="D9EAD3"),
+        )
+    for money_col in ["amount", "base_exposed"]:
+        if money_col in preview_lines.columns:
+            col_letter = get_column_letter(preview_lines.columns.get_loc(money_col) + 1)
+            for cell in ws3[col_letter][1:]:
+                cell.number_format = '"$"#,##0'
     freeze(ws3)
     add_filters(ws3, preview_lines)
 
@@ -858,8 +1003,9 @@ def run(
     amount_parse_zero = 0
     missing_vendor = 0
 
-    supplier_agg: Dict[str, float] = {}
-    category_agg: Dict[str, float] = {}
+    scenarios = ["conservative", "base", "high"]
+    supplier_agg: Dict[str, Dict[str, float]] = {s: {} for s in scenarios}
+    category_agg: Dict[str, Dict[str, float]] = {s: {} for s in scenarios}
 
     preview_frames: List[pd.DataFrame] = []
     scored_out_path = os.path.join(outdir, "tariff_lines_scored.csv")
@@ -913,11 +1059,13 @@ def run(
 
             exposed_base = bases["base_total_base"]
 
-            # aggregate
-            for v, val in zip(vendor_parent.tolist(), exposed_base.tolist()):
-                supplier_agg[v] = supplier_agg.get(v, 0.0) + float(val)
-            for c, val in zip(category_final.tolist(), exposed_base.tolist()):
-                category_agg[c] = category_agg.get(c, 0.0) + float(val)
+            # aggregate by scenario
+            for s in scenarios:
+                exposed_s = bases[f"{s}_total_base"]
+                for v, val in zip(vendor_parent.tolist(), exposed_s.tolist()):
+                    supplier_agg[s][v] = supplier_agg[s].get(v, 0.0) + float(val)
+                for c, val in zip(category_final.tolist(), exposed_s.tolist()):
+                    category_agg[s][c] = category_agg[s].get(c, 0.0) + float(val)
 
             # preview lines
             if sum(len(x) for x in preview_frames) < excel_data_preview_rows:
@@ -966,30 +1114,40 @@ def run(
                 )
 
     # rollups
-    top_suppliers_df = (
-        pd.DataFrame({"vendor_parent": list(supplier_agg.keys()), "base_exposed": list(supplier_agg.values())})
-        .sort_values("base_exposed", ascending=False)
-        .head(int(top_n))
-        .reset_index(drop=True)
-    )
-    top_categories_df = (
-        pd.DataFrame({"category": list(category_agg.keys()), "base_exposed": list(category_agg.values())})
-        .sort_values("base_exposed", ascending=False)
-        .head(int(top_n))
-        .reset_index(drop=True)
-    )
+    top_suppliers_dfs: Dict[str, pd.DataFrame] = {}
+    top_categories_dfs: Dict[str, pd.DataFrame] = {}
+    for s in scenarios:
+        top_suppliers_dfs[s] = (
+            pd.DataFrame({"vendor_parent": list(supplier_agg[s].keys()), f"{s}_exposed": list(supplier_agg[s].values())})
+            .sort_values(f"{s}_exposed", ascending=False)
+            .head(int(top_n))
+            .reset_index(drop=True)
+        )
+        top_categories_dfs[s] = (
+            pd.DataFrame({"category": list(category_agg[s].keys()), f"{s}_exposed": list(category_agg[s].values())})
+            .sort_values(f"{s}_exposed", ascending=False)
+            .head(int(top_n))
+            .reset_index(drop=True)
+        )
 
     # summary
-    base_total = float(top_categories_df["base_exposed"].sum()) if len(top_categories_df) else 0.0
+    conservative_total = float(top_categories_dfs["conservative"]["conservative_exposed"].sum()) if len(top_categories_dfs["conservative"]) else 0.0
+    base_total = float(top_categories_dfs["base"]["base_exposed"].sum()) if len(top_categories_dfs["base"]) else 0.0
+    high_total = float(top_categories_dfs["high"]["high_exposed"].sum()) if len(top_categories_dfs["high"]) else 0.0
     summary = {
         "calendar_year": calendar_year,
         "tariff_rate": tariff_rate,
         "total_rows": int(total_rows),
         "total_spend": float(total_spend),
+        "conservative_exposed_spend_top_categories_sum": float(conservative_total),
         "base_exposed_spend_top_categories_sum": float(base_total),
+        "high_exposed_spend_top_categories_sum": float(high_total),
+        "estimated_tariff_cost_conservative_top_categories_sum": float(conservative_total * float(tariff_rate)),
         "estimated_tariff_cost_base_top_categories_sum": float(base_total * float(tariff_rate)),
+        "estimated_tariff_cost_high_top_categories_sum": float(high_total * float(tariff_rate)),
         "amount_parse_zero_rate": float(amount_parse_zero / max(1, total_rows)),
         "missing_vendor_rate": float(missing_vendor / max(1, total_rows)),
+        "assumptions": asdict(assumptions),
     }
     if expected_total_spend is not None and expected_total_spend > 0:
         summary["coverage_pct_vs_expected"] = float(total_spend / expected_total_spend)
@@ -998,8 +1156,9 @@ def run(
     with open(os.path.join(outdir, "tariff_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    top_suppliers_df.to_csv(os.path.join(outdir, "top_suppliers_base.csv"), index=False)
-    top_categories_df.to_csv(os.path.join(outdir, "top_categories_base.csv"), index=False)
+    for s in scenarios:
+        top_suppliers_dfs[s].to_csv(os.path.join(outdir, f"top_suppliers_{s}.csv"), index=False)
+        top_categories_dfs[s].to_csv(os.path.join(outdir, f"top_categories_{s}.csv"), index=False)
 
     preview_lines = pd.concat(preview_frames, ignore_index=True) if preview_frames else pd.DataFrame()
 
@@ -1008,8 +1167,8 @@ def run(
         write_excel_report(
             out_path=excel_path,
             summary=summary,
-            top_suppliers=top_suppliers_df,
-            top_categories=top_categories_df,
+            top_suppliers=top_suppliers_dfs,
+            top_categories=top_categories_dfs,
             preview_lines=preview_lines,
         )
         log.append(f"Wrote Excel: {excel_path}")
